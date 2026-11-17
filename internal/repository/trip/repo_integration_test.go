@@ -50,6 +50,7 @@ func setupTestDB(t *testing.T) (*pgxpool.Pool, *repoPkg.Repository, *transaction
 }
 
 func cleanupTrip(ctx context.Context, pool *pgxpool.Pool, tripID uuid.UUID) {
+	_, _ = pool.Exec(ctx, "DELETE FROM trip_positions WHERE trip_id = $1", tripID)
 	_, _ = pool.Exec(ctx, "DELETE FROM trip_status_history WHERE trip_id = $1", tripID)
 	_, _ = pool.Exec(ctx, "DELETE FROM trips WHERE id = $1", tripID)
 }
@@ -243,4 +244,174 @@ func TestRepository_TransactionRollback(t *testing.T) {
 	// Поездка не должна была сохраниться в БД после паники
 	_, err = repo.GetByID(ctx, tripID)
 	assert.ErrorIs(t, err, trip.ErrTripNotFound)
+}
+
+func TestRepository_GetStaleTrips(t *testing.T) {
+	pool, repo, _ := setupTestDB(t)
+	defer pool.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	staleTripID := uuid.New()
+	freshTripID := uuid.New()
+	completedTripID := uuid.New()
+
+	defer cleanupTrip(ctx, pool, staleTripID)
+	defer cleanupTrip(ctx, pool, freshTripID)
+	defer cleanupTrip(ctx, pool, completedTripID)
+
+	staleTrip := &model.Trip{
+		ID:         staleTripID,
+		UserID:     uuid.New(),
+		DriverID:   uuid.New(),
+		StartPoint: trip.Coordinates{Latitude: 55.75, Longitude: 37.61},
+		EndPoint:   trip.Coordinates{Latitude: 55.76, Longitude: 37.62},
+		Price:      500,
+		Status:     trip.StatusActive,
+		StartedAt:  now.Add(-10 * time.Minute),
+		CreatedAt:  now.Add(-10 * time.Minute),
+		UpdatedAt:  now.Add(-10 * time.Minute),
+	}
+	require.NoError(t, repo.Create(ctx, staleTrip))
+
+	freshTrip := &model.Trip{
+		ID:         freshTripID,
+		UserID:     uuid.New(),
+		DriverID:   uuid.New(),
+		StartPoint: trip.Coordinates{Latitude: 55.75, Longitude: 37.61},
+		EndPoint:   trip.Coordinates{Latitude: 55.76, Longitude: 37.62},
+		Price:      600,
+		Status:     trip.StatusActive,
+		StartedAt:  now.Add(-10 * time.Minute),
+		CreatedAt:  now.Add(-10 * time.Minute),
+		UpdatedAt:  now.Add(-10 * time.Minute),
+	}
+	require.NoError(t, repo.Create(ctx, freshTrip))
+
+	_, err := repo.SavePosition(ctx, &model.CreatePositionInput{
+		TripID:      freshTripID,
+		Coordinates: trip.Coordinates{Latitude: 55.751, Longitude: 37.611},
+		RecordedAt:  now.Add(-10 * time.Second),
+	})
+	require.NoError(t, err)
+
+	completedTrip := &model.Trip{
+		ID:         completedTripID,
+		UserID:     uuid.New(),
+		DriverID:   uuid.New(),
+		StartPoint: trip.Coordinates{Latitude: 55.75, Longitude: 37.61},
+		EndPoint:   trip.Coordinates{Latitude: 55.76, Longitude: 37.62},
+		Price:      700,
+		Status:     trip.StatusActive,
+		StartedAt:  now.Add(-10 * time.Minute),
+		CreatedAt:  now.Add(-10 * time.Minute),
+		UpdatedAt:  now.Add(-10 * time.Minute),
+	}
+	require.NoError(t, repo.Create(ctx, completedTrip))
+	_, err = repo.Finish(ctx, completedTripID, now.Add(-5*time.Minute))
+	require.NoError(t, err)
+
+	staleCutoff := now.Add(-1 * time.Minute)
+	staleList, err := repo.GetStaleTrips(ctx, staleCutoff, 0)
+	require.NoError(t, err)
+
+	var foundStale, foundFresh, foundCompleted bool
+	for _, tr := range staleList {
+		if tr.ID == staleTripID {
+			foundStale = true
+		}
+		if tr.ID == freshTripID {
+			foundFresh = true
+		}
+		if tr.ID == completedTripID {
+			foundCompleted = true
+		}
+	}
+
+	assert.True(t, foundStale)
+	assert.False(t, foundFresh)
+	assert.False(t, foundCompleted)
+}
+
+func TestRepository_SavePositionAndRollback(t *testing.T) {
+	pool, repo, txMgr := setupTestDB(t)
+	defer pool.Close()
+
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tripID := uuid.New()
+
+	defer cleanupTrip(ctx, pool, tripID)
+
+	tr := &model.Trip{
+		ID:         tripID,
+		UserID:     uuid.New(),
+		DriverID:   uuid.New(),
+		StartPoint: trip.Coordinates{Latitude: 55.75, Longitude: 37.61},
+		EndPoint:   trip.Coordinates{Latitude: 55.76, Longitude: 37.62},
+		Price:      500,
+		Status:     trip.StatusActive,
+		StartedAt:  now.Add(-10 * time.Minute),
+		CreatedAt:  now.Add(-10 * time.Minute),
+		UpdatedAt:  now.Add(-10 * time.Minute),
+	}
+	require.NoError(t, repo.Create(ctx, tr))
+
+	t1 := now.Add(-5 * time.Minute).Truncate(time.Microsecond)
+	pos1, err := repo.SavePosition(ctx, &model.CreatePositionInput{
+		TripID:      tripID,
+		Coordinates: trip.Coordinates{Latitude: 55.751, Longitude: 37.611},
+		RecordedAt:  t1,
+	})
+	require.NoError(t, err)
+	assert.NotZero(t, pos1.ID)
+
+	fetched, err := repo.GetByID(ctx, tripID)
+	require.NoError(t, err)
+	require.NotNil(t, fetched.LastPositionAt)
+	assert.True(t, t1.Equal(*fetched.LastPositionAt))
+
+	tOlder := now.Add(-8 * time.Minute).Truncate(time.Microsecond)
+	_, err = repo.SavePosition(ctx, &model.CreatePositionInput{
+		TripID:      tripID,
+		Coordinates: trip.Coordinates{Latitude: 55.752, Longitude: 37.612},
+		RecordedAt:  tOlder,
+	})
+	require.NoError(t, err)
+
+	fetched, err = repo.GetByID(ctx, tripID)
+	require.NoError(t, err)
+	require.NotNil(t, fetched.LastPositionAt)
+	assert.True(t, t1.Equal(*fetched.LastPositionAt))
+
+	positionsList, err := repo.ListPositions(ctx, tripID)
+	require.NoError(t, err)
+	require.Len(t, positionsList, 2)
+	assert.True(t, tOlder.Equal(positionsList[0].RecordedAt))
+	assert.True(t, t1.Equal(positionsList[1].RecordedAt))
+
+	simulatedErr := errors.New("rollback simulated")
+	tNewer := now.Add(-1 * time.Minute)
+	err = txMgr.Do(ctx, func(txCtx context.Context) error {
+		_, saveErr := repo.SavePosition(txCtx, &model.CreatePositionInput{
+			TripID:      tripID,
+			Coordinates: trip.Coordinates{Latitude: 55.753, Longitude: 37.613},
+			RecordedAt:  tNewer,
+		})
+		if saveErr != nil {
+			return saveErr
+		}
+		return simulatedErr
+	})
+	require.ErrorIs(t, err, simulatedErr)
+
+	fetchedAfterRollback, err := repo.GetByID(ctx, tripID)
+	require.NoError(t, err)
+	require.NotNil(t, fetchedAfterRollback.LastPositionAt)
+	assert.True(t, t1.Equal(*fetchedAfterRollback.LastPositionAt))
+
+	positionsAfterRollback, err := repo.ListPositions(ctx, tripID)
+	require.NoError(t, err)
+	assert.Len(t, positionsAfterRollback, 2)
 }

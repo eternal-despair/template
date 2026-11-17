@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	sq "github.com/Masterminds/squirrel"
@@ -111,10 +112,7 @@ func (r *Repository) Finish(ctx context.Context, id uuid.UUID, finishedAt time.T
 			"id":     id,
 			"status": string(trip.StatusActive),
 		}).
-		Suffix("RETURNING " + fmt.Sprintf("%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s",
-			"id", "user_id", "driver_id", "start_latitude", "start_longitude",
-			"end_latitude", "end_longitude", "price", "status", "started_at",
-			"finished_at", "created_at", "updated_at")).
+		Suffix("RETURNING " + strings.Join(tripColumns, ", ")).
 		ToSql()
 	if err != nil {
 		return nil, fmt.Errorf("build finish trip query: %w", err)
@@ -134,6 +132,7 @@ func (r *Repository) Finish(ctx context.Context, id uuid.UUID, finishedAt time.T
 		&d.Status,
 		&d.StartedAt,
 		&d.FinishedAt,
+		&d.LastPositionAt,
 		&d.CreatedAt,
 		&d.UpdatedAt,
 	)
@@ -152,4 +151,42 @@ func (r *Repository) Finish(ctx context.Context, id uuid.UUID, finishedAt time.T
 	}
 
 	return d.toModel(), nil
+}
+
+func (r *Repository) SavePosition(ctx context.Context, pos *model.CreatePositionInput) (*model.TripPosition, error) {
+	exec := r.getExecutor(ctx)
+
+	const insertPosSQL = `
+		INSERT INTO trip_positions (trip_id, latitude, longitude, recorded_at)
+		VALUES ($1, $2, $3, $4)
+		RETURNING id, created_at
+	`
+
+	var result model.TripPosition
+	result.TripID = pos.TripID
+	result.Coordinates = pos.Coordinates
+	result.RecordedAt = pos.RecordedAt
+
+	err := exec.QueryRow(ctx, insertPosSQL, pos.TripID, pos.Coordinates.Latitude, pos.Coordinates.Longitude, pos.RecordedAt).
+		Scan(&result.ID, &result.CreatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("insert trip position: %w", err)
+	}
+
+	const updateTripSQL = `
+		UPDATE trips
+		SET last_position_at = CASE
+			WHEN last_position_at IS NULL OR $2 > last_position_at THEN $2
+			ELSE last_position_at
+		END,
+		updated_at = now()
+		WHERE id = $1
+	`
+
+	_, err = exec.Exec(ctx, updateTripSQL, pos.TripID, pos.RecordedAt)
+	if err != nil {
+		return nil, fmt.Errorf("update trip last_position_at: %w", err)
+	}
+
+	return &result, nil
 }
