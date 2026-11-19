@@ -21,6 +21,7 @@ type dbTrip struct {
 	Status         string
 	StartedAt      time.Time
 	FinishedAt     *time.Time
+	LastPositionAt *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -38,11 +39,12 @@ func (d *dbTrip) toModel() *model.Trip {
 			Latitude:  d.EndLatitude,
 			Longitude: d.EndLongitude,
 		},
-		Price:      d.Price,
-		Status:     trip.Status(d.Status),
-		StartedAt:  d.StartedAt,
-		FinishedAt: d.FinishedAt,
-		CreatedAt:  d.CreatedAt,
-		UpdatedAt:  d.UpdatedAt,
+		Price:          d.Price,
+		Status:         trip.Status(d.Status),
+		StartedAt:      d.StartedAt,
+		FinishedAt:     d.FinishedAt,
+		LastPositionAt: d.LastPositionAt,
+		CreatedAt:      d.CreatedAt,
+		UpdatedAt:      d.UpdatedAt,
 	}
 }

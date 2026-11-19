@@ -13,12 +13,15 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/eternal-despair/template/internal/config"
+	pushGateway "github.com/eternal-despair/template/internal/gateway/push"
 	api "github.com/eternal-despair/template/internal/generated"
 	apphttp "github.com/eternal-despair/template/internal/http"
 	"github.com/eternal-despair/template/internal/http/middleware"
 	createHandler "github.com/eternal-despair/template/internal/http/trip/create"
 	finishHandler "github.com/eternal-despair/template/internal/http/trip/finish"
 	getHandler "github.com/eternal-despair/template/internal/http/trip/get"
+	createPosHandler "github.com/eternal-despair/template/internal/http/trip/position/create"
+	listPosHandler "github.com/eternal-despair/template/internal/http/trip/position/list"
 	"github.com/eternal-despair/template/internal/infra/postgres"
 	"github.com/eternal-despair/template/internal/infra/postgres/transaction"
 	"github.com/eternal-despair/template/internal/infra/telemetry"
@@ -26,6 +29,9 @@ import (
 	createUC "github.com/eternal-despair/template/internal/usecase/trip/create"
 	finishUC "github.com/eternal-despair/template/internal/usecase/trip/finish"
 	getUC "github.com/eternal-despair/template/internal/usecase/trip/get"
+	createPosUC "github.com/eternal-despair/template/internal/usecase/trip/position/create"
+	listPosUC "github.com/eternal-despair/template/internal/usecase/trip/position/list"
+	positionsWorker "github.com/eternal-despair/template/internal/worker/positions"
 )
 
 type Container struct {
@@ -34,6 +40,7 @@ type Container struct {
 	pool       *pgxpool.Pool
 	telemetry  *telemetry.Telemetry
 	httpServer *nethttp.Server
+	workerPool *positionsWorker.Pool
 }
 
 func New(ctx context.Context, cfg *config.Config) (*Container, error) {
@@ -53,14 +60,29 @@ func New(ctx context.Context, cfg *config.Config) (*Container, error) {
 	txMgr := transaction.New(pool)
 	repo := tripRepo.New(pool)
 
+	gateway := pushGateway.NewClient(cfg.PushHTTPURL, cfg.PushRequestTimeout, tel.Tracer)
+
+	poolCfg := positionsWorker.Config{
+		CheckInterval: cfg.PositionCheckInterval,
+		StaleAfter:    cfg.PositionStaleAfter,
+		Workers:       cfg.PositionWorkers,
+		QueueSize:     cfg.PositionQueueSize,
+		PushTimeout:   cfg.PushRequestTimeout,
+	}
+	workerPool := positionsWorker.NewPool(poolCfg, repo, gateway, tel.Metrics, logger, tel.Tracer, nil)
+
 	createUsecase := createUC.New(repo, txMgr, logger, tel.Metrics)
 	getUsecase := getUC.New(repo)
 	finishUsecase := finishUC.New(repo, txMgr, logger, tel.Metrics)
+	createPosUsecase := createPosUC.New(repo, txMgr, workerPool, tel.Metrics)
+	listPosUsecase := listPosUC.New(repo)
 
 	createH := createHandler.New(createUsecase)
 	getH := getHandler.New(getUsecase)
 	finishH := finishHandler.New(finishUsecase)
-	apiServer := apphttp.NewServer(createH, getH, finishH, pool)
+	createPosH := createPosHandler.New(createPosUsecase)
+	listPosH := listPosHandler.New(listPosUsecase)
+	apiServer := apphttp.NewServer(createH, getH, finishH, createPosH, listPosH, pool)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Recover(logger))
@@ -85,11 +107,14 @@ func New(ctx context.Context, cfg *config.Config) (*Container, error) {
 		pool:       pool,
 		telemetry:  tel,
 		httpServer: httpServer,
+		workerPool: workerPool,
 	}, nil
 }
 
 func (c *Container) Run() error {
 	c.logger.Info("trip-service starting", slog.String("addr", c.cfg.HTTPAddr))
+	c.workerPool.Start()
+
 	err := c.httpServer.ListenAndServe()
 	if err != nil && !errors.Is(err, nethttp.ErrServerClosed) {
 		return err
@@ -99,7 +124,19 @@ func (c *Container) Run() error {
 
 func (c *Container) Shutdown(ctx context.Context) error {
 	c.logger.Info("trip-service shutting down")
-	return c.httpServer.Shutdown(ctx)
+
+	if err := c.httpServer.Shutdown(ctx); err != nil {
+		c.logger.Error("error shutting down http server", slog.Any("error", err))
+	}
+
+	c.workerPool.StopScanner()
+
+	if err := c.workerPool.Shutdown(ctx); err != nil {
+		c.logger.Error("error shutting down worker pool", slog.Any("error", err))
+		return err
+	}
+
+	return nil
 }
 
 func (c *Container) Close() {

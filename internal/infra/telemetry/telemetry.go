@@ -29,10 +29,16 @@ type Telemetry struct {
 }
 
 type Metrics struct {
-	TripsCreated    metric.Int64Counter
-	TripsCompleted  metric.Int64Counter
-	RequestDuration metric.Float64Histogram
-	ActiveRequests  metric.Int64UpDownCounter
+	TripsCreated             metric.Int64Counter
+	TripsCompleted           metric.Int64Counter
+	RequestDuration          metric.Float64Histogram
+	ActiveRequests           metric.Int64UpDownCounter
+	PositionsSaved           metric.Int64Counter
+	StaleChecks              metric.Int64Counter
+	PositionRequests         metric.Int64Counter
+	PositionRequestsDuration metric.Float64Histogram
+	QueueSizeGauge           metric.Int64Gauge
+	ActiveWorkersGauge       metric.Int64Gauge
 }
 
 func (m *Metrics) TripCreated(ctx context.Context) {
@@ -44,6 +50,42 @@ func (m *Metrics) TripCreated(ctx context.Context) {
 func (m *Metrics) TripCompleted(ctx context.Context) {
 	if m != nil && m.TripsCompleted != nil {
 		m.TripsCompleted.Add(ctx, 1)
+	}
+}
+
+func (m *Metrics) PositionSaved(ctx context.Context) {
+	if m != nil && m.PositionsSaved != nil {
+		m.PositionsSaved.Add(ctx, 1)
+	}
+}
+
+func (m *Metrics) RecordStaleCheck(ctx context.Context, result string) {
+	if m != nil && m.StaleChecks != nil {
+		m.StaleChecks.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+	}
+}
+
+func (m *Metrics) RecordPositionRequest(ctx context.Context, result string) {
+	if m != nil && m.PositionRequests != nil {
+		m.PositionRequests.Add(ctx, 1, metric.WithAttributes(attribute.String("result", result)))
+	}
+}
+
+func (m *Metrics) RecordPositionRequestDuration(ctx context.Context, result string, durationSec float64) {
+	if m != nil && m.PositionRequestsDuration != nil {
+		m.PositionRequestsDuration.Record(ctx, durationSec, metric.WithAttributes(attribute.String("result", result)))
+	}
+}
+
+func (m *Metrics) RecordQueueSize(ctx context.Context, size int64) {
+	if m != nil && m.QueueSizeGauge != nil {
+		m.QueueSizeGauge.Record(ctx, size)
+	}
+}
+
+func (m *Metrics) RecordActiveWorkers(ctx context.Context, count int64) {
+	if m != nil && m.ActiveWorkersGauge != nil {
+		m.ActiveWorkersGauge.Record(ctx, count)
 	}
 }
 
@@ -195,11 +237,69 @@ func initMetrics(meter metric.Meter) (*Metrics, error) {
 		return nil, err
 	}
 
+	positionsSaved, err := meter.Int64Counter(
+		"tripgo.positions.saved",
+		metric.WithDescription("Total number of saved positions"),
+		metric.WithUnit("{position}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	staleChecks, err := meter.Int64Counter(
+		"tripgo.stale_checks",
+		metric.WithDescription("Results of stale trip checks by scanner"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	positionRequests, err := meter.Int64Counter(
+		"tripgo.position_requests",
+		metric.WithDescription("Results of position requests to push service"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	posReqDuration, err := meter.Float64Histogram(
+		"tripgo.position_requests.duration",
+		metric.WithDescription("Duration of position request calls to push service"),
+		metric.WithUnit("s"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	queueSizeGauge, err := meter.Int64Gauge(
+		"tripgo.position_requests.queue.size",
+		metric.WithDescription("Current size of the position request queue"),
+		metric.WithUnit("{task}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	activeWorkersGauge, err := meter.Int64Gauge(
+		"tripgo.position_requests.workers.active",
+		metric.WithDescription("Current count of active position request workers"),
+		metric.WithUnit("{worker}"),
+	)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Metrics{
-		TripsCreated:    tripsCreated,
-		TripsCompleted:  tripsCompleted,
-		RequestDuration: reqDuration,
-		ActiveRequests:  activeReqs,
+		TripsCreated:             tripsCreated,
+		TripsCompleted:           tripsCompleted,
+		RequestDuration:          reqDuration,
+		ActiveRequests:           activeReqs,
+		PositionsSaved:           positionsSaved,
+		StaleChecks:              staleChecks,
+		PositionRequests:         positionRequests,
+		PositionRequestsDuration: posReqDuration,
+		QueueSizeGauge:           queueSizeGauge,
+		ActiveWorkersGauge:       activeWorkersGauge,
 	}, nil
 }
 

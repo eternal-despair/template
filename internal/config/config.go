@@ -26,6 +26,13 @@ type Config struct {
 	OtelExporterOTLPProtocol string
 	OtelResourceAttributes   string
 	OtelTracesSampler        string
+
+	PositionCheckInterval time.Duration
+	PositionStaleAfter    time.Duration
+	PositionWorkers       int
+	PositionQueueSize     int
+	PushHTTPURL           string
+	PushRequestTimeout    time.Duration
 }
 
 func Load() (*Config, error) {
@@ -78,6 +85,33 @@ func Load() (*Config, error) {
 	cfg.OtelResourceAttributes = getEnv("OTEL_RESOURCE_ATTRIBUTES", "service.namespace=tripgo,deployment.environment=local")
 	cfg.OtelTracesSampler = getEnv("OTEL_TRACES_SAMPLER", "parentbased_always_on")
 
+	cfg.PositionCheckInterval, err = getEnvDuration("POSITION_CHECK_INTERVAL", 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("invalid POSITION_CHECK_INTERVAL: %w", err)
+	}
+
+	cfg.PositionStaleAfter, err = getEnvDuration("POSITION_STALE_AFTER", 60*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("invalid POSITION_STALE_AFTER: %w", err)
+	}
+
+	cfg.PositionWorkers, err = getEnvInt("POSITION_WORKERS", 4)
+	if err != nil {
+		return nil, fmt.Errorf("invalid POSITION_WORKERS: %w", err)
+	}
+
+	cfg.PositionQueueSize, err = getEnvInt("POSITION_QUEUE_SIZE", 100)
+	if err != nil {
+		return nil, fmt.Errorf("invalid POSITION_QUEUE_SIZE: %w", err)
+	}
+
+	cfg.PushHTTPURL = getEnv("PUSH_HTTP_URL", "http://localhost:8090")
+
+	cfg.PushRequestTimeout, err = getEnvDuration("PUSH_REQUEST_TIMEOUT", 1*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("invalid PUSH_REQUEST_TIMEOUT: %w", err)
+	}
+
 	return cfg, nil
 }
 
@@ -110,4 +144,16 @@ func getEnvInt32(key string, defaultValue int32) (int32, error) {
 		return 0, fmt.Errorf("parse %s=%q: %w", key, val, err)
 	}
 	return int32(n), nil
+}
+
+func getEnvInt(key string, defaultValue int) (int, error) {
+	val := os.Getenv(key)
+	if val == "" {
+		return defaultValue, nil
+	}
+	n, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, fmt.Errorf("parse %s=%q: %w", key, val, err)
+	}
+	return n, nil
 }

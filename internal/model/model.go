@@ -30,3 +30,17 @@ type TripStatusHistory struct {
 	Reason     *string
 	ChangedAt  time.Time
 }
+
+type TripPosition struct {
+	ID          int64
+	TripID      uuid.UUID
+	Coordinates Coordinates
+	RecordedAt  time.Time
+	CreatedAt   time.Time
+}
+
+type CreatePositionInput struct {
+	TripID      uuid.UUID
+	Coordinates Coordinates
+	RecordedAt  time.Time
+}
